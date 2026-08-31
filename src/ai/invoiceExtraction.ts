@@ -112,7 +112,7 @@ export async function extractInvoiceData(params: {
     messages: [
       {
         role: 'user',
-        content: [documentBlock, { type: 'text', text: userText }],
+              content: [documentBlock, { type: 'text', text: userText }],
       },
     ],
   });
