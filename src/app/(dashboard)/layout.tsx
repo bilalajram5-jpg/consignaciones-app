@@ -43,7 +43,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
         </div>
         <nav className="flex flex-col gap-1">
           {visibleItems.map((item) => (
-            <NavLink key={item.href} href={item.href} label={item.label} icon={item.icon} />
+            <NavLink key={item.href} href={item.href} label={item.label} icon={<item.icon className="h-4 w-4 shrink-0" />} />
           ))}
         </nav>
         <div className="mt-auto">
@@ -63,7 +63,13 @@ export default async function DashboardLayout({ children }: { children: React.Re
         <main className="flex-1 p-4 md:p-6">{children}</main>
 
         {/* Navegación inferior móvil (sección 25: mobile-first) */}
-        <MobileBottomNav items={visibleItems.slice(0, 5)} />
+        <MobileBottomNav
+          items={visibleItems.slice(0, 5).map((item) => ({
+            href: item.href,
+            label: item.label,
+            icon: <item.icon className="h-5 w-5" />,
+          }))}
+        />
       </div>
     </div>
   );
