@@ -222,7 +222,7 @@ model Invoice {
   updatedAt DateTime @updatedAt
 
   items              InvoiceItem[]
-  consignmentBatches ConsignmentBatch[]
+ 
 
   @@unique([customerId, invoiceNumber]) // misma factura no se repite para un cliente
   @@index([invoiceDate])
