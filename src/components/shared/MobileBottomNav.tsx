@@ -3,23 +3,12 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { cn } from '@/lib/utils';
-import type { LucideIcon } from 'lucide-react';
+import type { ReactNode } from 'react';
 
-/**
- * Navegación inferior móvil (sección 25: mobile-first). Antes usaba
- * etiquetas `<a href>` planas, lo que forzaba una recarga completa de
- * página en cada tap (mucho más lento y costoso en datos, justo en el
- * dispositivo/red donde menos conviene — el mismo escenario de conectividad
- * inestable que se endureció en `InventoryCountWizard`) y nunca resaltaba
- * en qué sección estaba parado el usuario. Se extrajo a un componente
- * cliente para poder usar `next/link` (navegación del lado del cliente,
- * sin recarga) y `usePathname` (resaltar la pestaña activa), igual que ya
- * hace `NavLink.tsx` para la barra lateral de escritorio.
- */
 export function MobileBottomNav({
   items,
 }: {
-  items: Array<{ href: string; label: string; icon: LucideIcon }>;
+  items: Array<{ href: string; label: string; icon: ReactNode }>;
 }) {
   const pathname = usePathname();
 
@@ -36,7 +25,7 @@ export function MobileBottomNav({
               active ? 'text-primary font-medium' : 'text-muted-foreground'
             )}
           >
-            <item.icon className="h-5 w-5" />
+            {item.icon}
             {item.label}
           </Link>
         );
