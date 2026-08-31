@@ -1,0 +1,614 @@
+// ============================================================================
+// SCHEMA DE BASE DE DATOS — Sistema de Gestión de Consignaciones
+// ----------------------------------------------------------------------------
+// Reglas de diseño (ver ARCHITECTURE.md y DECISIONS.md para el razonamiento):
+//  1. Dinero SIEMPRE en Decimal (NUNCA Float).
+//  2. Nada se sobrescribe: entregas, cortes, ventas y pagos son append-only.
+//  3. El inventario y el saldo NUNCA se guardan como un campo mutable único;
+//     se derivan de la suma de movimientos (ConsignmentBatch + Sale/Return/
+//     Adjustment para inventario; AccountMovement para saldo). Guardamos
+//     también snapshots inmutables (InventoryCount, ConsignmentCut) para
+//     performance y para el historial "congelado" de cada visita.
+//  4. Todo lo que crea o modifica dinero/inventario referencia al usuario que
+//     lo hizo (createdBy) y queda además reflejado en AuditLog.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// USUARIOS Y ROLES
+// ----------------------------------------------------------------------------
+
+enum UserRole {
+  ADMINISTRADOR
+  VENDEDOR
+  CONTABILIDAD
+  VISOR
+}
+
+enum UserStatus {
+  ACTIVO
+  INACTIVO
+}
+
+model User {
+  id            String     @id @default(cuid())
+  name          String
+  email         String     @unique
+  passwordHash  String
+  role          UserRole   @default(VENDEDOR)
+  status        UserStatus @default(ACTIVO)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  // Relaciones de "quién hizo qué" (auditoría a nivel de FK, además de AuditLog)
+  customersAsVendor    Customer[]              @relation("VendorCustomers")
+  invoicesUploaded     Invoice[]               @relation("InvoiceUploadedBy")
+  invoicesConfirmed    Invoice[]               @relation("InvoiceConfirmedBy")
+  inventoryCounts      InventoryCount[]        @relation("InventoryCountedBy")
+  adjustments          InventoryAdjustment[]   @relation("AdjustmentCreatedBy")
+  payments             Payment[]               @relation("PaymentRegisteredBy")
+  returns              Return[]                @relation("ReturnRegisteredBy")
+  accountMovements     AccountMovement[]       @relation("AccountMovementCreatedBy")
+  auditLogs            AuditLog[]              @relation("AuditLogUser")
+  sessions              Session[]
+  accounts               Account[]
+
+  @@map("users")
+}
+
+// Tablas requeridas por NextAuth (Credentials + estrategia JWT igualmente
+// necesita tabla Session si se usa `strategy: "database"`; se incluyen para
+// permitir ambas estrategias sin cambios de schema).
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+// ----------------------------------------------------------------------------
+// CLIENTES
+// ----------------------------------------------------------------------------
+
+enum CustomerStatus {
+  ACTIVO
+  INACTIVO
+}
+
+model Customer {
+  id              String         @id @default(cuid())
+  code            String         @unique // ID interno legible, ej. CLI-0001
+  tradeName       String // Nombre comercial
+  legalName       String // Razón social
+  ruc             String?
+  dv              String?
+  address         String?
+  phone           String?
+  email           String?
+  contactPerson   String?
+  vendorId        String?
+  vendor          User?          @relation("VendorCustomers", fields: [vendorId], references: [id])
+  startDate       DateTime       @default(now())
+  status          CustomerStatus @default(ACTIVO)
+  notes           String?        @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  createdBy String?
+
+  invoices            Invoice[]
+  consignmentBatches  ConsignmentBatch[]
+  inventoryCounts     InventoryCount[]
+  consignmentCuts     ConsignmentCut[]
+  payments            Payment[]
+  returns             Return[]
+  inventoryAdjustments InventoryAdjustment[]
+  accountMovements    AccountMovement[]
+
+  @@map("customers")
+}
+
+// ----------------------------------------------------------------------------
+// PRODUCTOS
+// ----------------------------------------------------------------------------
+
+enum ProductStatus {
+  ACTIVO
+  INACTIVO
+}
+
+model Product {
+  id            String        @id @default(cuid())
+  sku           String        @unique // Referencia
+  barcode       String?       @unique
+  name          String
+  description   String?       @db.Text
+  category      String?
+  imageUrl      String?
+  standardPrice Decimal       @db.Decimal(14, 2)
+  status        ProductStatus @default(ACTIVO)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  createdBy String?
+
+  invoiceItems       InvoiceItem[]
+  consignmentBatches ConsignmentBatch[]
+  countItems         InventoryCountItem[]
+  saleItems          SaleItem[]
+  returnItems        ReturnItem[]
+  adjustments        InventoryAdjustment[]
+
+  @@index([sku])
+  @@map("products")
+}
+
+// ----------------------------------------------------------------------------
+// FACTURAS (fuente original, se conservan siempre; nunca se sobrescriben)
+// ----------------------------------------------------------------------------
+
+enum InvoiceSourceType {
+  PDF
+  IMAGE
+  MANUAL
+}
+
+enum InvoiceStatus {
+  PENDIENTE_REVISION // IA extrajo datos, esperando revisión humana
+  CONFIRMADA // Revisada y confirmada -> generó ConsignmentBatch(es)
+  RECHAZADA // Descartada (ej. duplicado confirmado como no válido)
+}
+
+model Invoice {
+  id            String            @id @default(cuid())
+  customerId    String
+  customer      Customer          @relation(fields: [customerId], references: [id])
+  invoiceNumber String
+  invoiceDate   DateTime
+  sourceType    InvoiceSourceType
+  sourceFileUrl String // Ruta en el StorageProvider al PDF/imagen original
+  status        InvoiceStatus     @default(PENDIENTE_REVISION)
+
+  invoiceTotal  Decimal @db.Decimal(14, 2)
+
+  // Metadatos de la extracción por IA (auditable / sección 30 del spec)
+  aiRawResponse   Json? // Respuesta cruda de la IA, para trazabilidad
+  aiModel         String?
+  aiOverallConfidence Decimal? @db.Decimal(5, 4)
+
+  possibleDuplicateOfId String?
+  possibleDuplicateOf   Invoice?  @relation("InvoiceDuplicate", fields: [possibleDuplicateOfId], references: [id])
+  duplicateFlags        Invoice[] @relation("InvoiceDuplicate")
+
+  uploadedById  String?
+  uploadedBy    User?     @relation("InvoiceUploadedBy", fields: [uploadedById], references: [id])
+  confirmedById String?
+  confirmedBy   User?     @relation("InvoiceConfirmedBy", fields: [confirmedById], references: [id])
+  confirmedAt   DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items              InvoiceItem[]
+  consignmentBatches ConsignmentBatch[]
+
+  @@unique([customerId, invoiceNumber]) // misma factura no se repite para un cliente
+  @@index([invoiceDate])
+  @@map("invoices")
+}
+
+model InvoiceItem {
+  id            String   @id @default(cuid())
+  invoiceId     String
+  invoice       Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  productId     String?
+  product       Product? @relation(fields: [productId], references: [id])
+
+  // Se guardan también como texto/valores planos porque al momento de subir
+  // la factura el producto puede no existir todavía en el catálogo (sección
+  // 36: "producto nuevo detectado en factura"); productId se enlaza cuando
+  // se confirma/crea el producto.
+  reference   String
+  description String
+  quantity    Decimal @db.Decimal(14, 3)
+  unitPrice   Decimal @db.Decimal(14, 2)
+  lineTotal   Decimal @db.Decimal(14, 2)
+
+  // Confidence scores de la IA por campo (sección 30)
+  referenceConfidence   Decimal? @db.Decimal(5, 4)
+  descriptionConfidence Decimal? @db.Decimal(5, 4)
+  quantityConfidence    Decimal? @db.Decimal(5, 4)
+  priceConfidence       Decimal? @db.Decimal(5, 4)
+
+  wasEditedManually Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  consignmentBatch ConsignmentBatch?
+
+  @@map("invoice_items")
+}
+
+// ----------------------------------------------------------------------------
+// INVENTARIO EN CONSIGNACIÓN
+// ----------------------------------------------------------------------------
+// Un ConsignmentBatch = un "lote" = una línea de factura confirmada. Es la
+// unidad atómica de FIFO: cada lote conserva su propio precio histórico y su
+// propia cantidad entregada, que NUNCA cambia. Las cantidades vendidas,
+// devueltas y ajustadas de ESE lote se acumulan en columnas separadas
+// (actualizadas transaccionalmente por los servicios correspondientes) para
+// que "inventario disponible del lote" se pueda leer en O(1) sin tener que
+// re-sumar todo el historial en cada consulta del dashboard. La verdad
+// última, sin embargo, siempre se puede reconstruir sumando SaleItem/
+// ReturnItem/InventoryAdjustment de ese lote — ver docs/erd.md.
+
+model ConsignmentBatch {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+  productId  String
+  product    Product  @relation(fields: [productId], references: [id])
+
+  invoiceId     String      @unique // 1 lote por línea de factura
+  invoiceItem   InvoiceItem @relation(fields: [invoiceId], references: [id])
+
+  deliveredQty Decimal @db.Decimal(14, 3) // NUNCA se modifica tras crearse
+  unitPrice    Decimal @db.Decimal(14, 2) // Precio histórico de ESTE lote, fijo
+
+  // Acumuladores de lectura rápida (siempre actualizados dentro de la misma
+  // transacción que crea el Sale/Return/Adjustment correspondiente).
+  soldQty     Decimal @default(0) @db.Decimal(14, 3)
+  returnedQty Decimal @default(0) @db.Decimal(14, 3)
+  adjustedQty Decimal @default(0) @db.Decimal(14, 3) // puede ser negativo
+
+  batchDate DateTime // = invoiceDate, usada para ordenar FIFO
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  saleItems   SaleItem[]
+  returnItems ReturnItem[]
+  adjustments InventoryAdjustment[]
+  countItems  InventoryCountItem[]
+
+  @@index([customerId, productId, batchDate])
+  @@map("consignment_batches")
+}
+
+// ----------------------------------------------------------------------------
+// INVENTARIO FÍSICO (VISITAS AL CLIENTE)
+// ----------------------------------------------------------------------------
+
+enum InventoryCountStatus {
+  BORRADOR // guardado para continuar después
+  CONFIRMADO // corte generado, inmutable
+}
+
+model InventoryCount {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  status InventoryCountStatus @default(BORRADOR)
+
+  countedById String?
+  countedBy   User?    @relation("InventoryCountedBy", fields: [countedById], references: [id])
+  visitDate   DateTime @default(now())
+
+  confirmedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items InventoryCountItem[]
+  cut   ConsignmentCut?
+
+  @@map("inventory_counts")
+}
+
+// Una fila por producto (agregado de todos sus lotes) revisado en la visita.
+// Registra tanto el modo usado (A: conteo físico, B: cantidad vendida) como
+// el resultado, que siempre pasa por la misma función de dominio
+// `reconcileInventoryCount` para garantizar resultados idénticos.
+model InventoryCountItem {
+  id               String         @id @default(cuid())
+  inventoryCountId String
+  inventoryCount   InventoryCount @relation(fields: [inventoryCountId], references: [id], onDelete: Cascade)
+  productId        String
+  product          Product        @relation(fields: [productId], references: [id])
+
+  entryMode      String // "CONTEO_FISICO" | "CANTIDAD_VENDIDA"
+  previousQty    Decimal @db.Decimal(14, 3) // inventario disponible al iniciar la visita
+  countedQty     Decimal? @db.Decimal(14, 3) // si entryMode = CONTEO_FISICO
+  soldQty        Decimal @db.Decimal(14, 3) // resultado, siempre presente
+  newQty         Decimal @db.Decimal(14, 3) // previousQty - soldQty (antes de devoluciones/ajustes posteriores)
+  unitPrice      Decimal @db.Decimal(14, 2) // precio ponderado usado para el cálculo (referencia; el cargo real usa FIFO por lote)
+  lineAmount     Decimal @db.Decimal(14, 2)
+
+  hasDiscrepancy Boolean @default(false) // conteo físico > inventario sistema
+
+  // Enlace a los lotes concretos afectados vía FIFO (para trazabilidad y
+  // conservar el precio histórico exacto de cada unidad vendida)
+  batchAllocations Json // [{ batchId, qty, unitPrice, amount }]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  consignmentBatch ConsignmentBatch[]
+  sale             Sale?
+
+  @@unique([inventoryCountId, productId])
+  @@map("inventory_count_items")
+}
+
+// ----------------------------------------------------------------------------
+// CORTES DE CONSIGNACIÓN (snapshot inmutable de una visita confirmada)
+// ----------------------------------------------------------------------------
+
+model ConsignmentCut {
+  id               String         @id @default(cuid())
+  cutNumber        Int            @unique @default(autoincrement())
+  customerId       String
+  customer         Customer       @relation(fields: [customerId], references: [id])
+  inventoryCountId String         @unique
+  inventoryCount   InventoryCount @relation(fields: [inventoryCountId], references: [id])
+
+  cutDate      DateTime @default(now())
+  itemsCount   Int
+  soldUnits    Decimal  @db.Decimal(14, 3)
+  totalAmount  Decimal  @db.Decimal(14, 2)
+  adjustmentsCount Int  @default(0)
+  returnsCount     Int  @default(0)
+
+  // Snapshot completo para impresión/PDF, congelado en el momento de confirmar
+  snapshot Json
+
+  createdAt DateTime @default(now())
+  createdBy String?
+
+  sale             Sale?
+  accountMovements AccountMovement[]
+
+  @@map("consignment_cuts")
+}
+
+// ----------------------------------------------------------------------------
+// VENTAS (generadas automáticamente al confirmar un corte)
+// ----------------------------------------------------------------------------
+
+model Sale {
+  id         String   @id @default(cuid())
+  customerId String
+  cutId      String?  @unique
+  cut        ConsignmentCut? @relation(fields: [cutId], references: [id])
+  inventoryCountItemId String? @unique
+  inventoryCountItem   InventoryCountItem? @relation(fields: [inventoryCountItemId], references: [id])
+
+  saleDate    DateTime @default(now())
+  totalAmount Decimal  @db.Decimal(14, 2)
+
+  createdAt DateTime @default(now())
+
+  items SaleItem[]
+
+  @@map("sales")
+}
+
+model SaleItem {
+  id                 String           @id @default(cuid())
+  saleId             String
+  sale               Sale             @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  consignmentBatchId String
+  consignmentBatch   ConsignmentBatch @relation(fields: [consignmentBatchId], references: [id])
+  productId          String
+  product            Product          @relation(fields: [productId], references: [id])
+
+  quantity  Decimal @db.Decimal(14, 3)
+  unitPrice Decimal @db.Decimal(14, 2) // precio histórico del lote (FIFO), no el precio actual del producto
+  lineTotal Decimal @db.Decimal(14, 2)
+
+  createdAt DateTime @default(now())
+
+  @@map("sale_items")
+}
+
+// ----------------------------------------------------------------------------
+// PAGOS
+// ----------------------------------------------------------------------------
+
+enum PaymentMethod {
+  EFECTIVO
+  ACH
+  TRANSFERENCIA
+  CHEQUE
+  TARJETA
+  OTRO
+}
+
+model Payment {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  paymentDate   DateTime      @default(now())
+  amount        Decimal       @db.Decimal(14, 2)
+  method        PaymentMethod
+  referenceNumber String?
+  bank            String?
+  notes           String? @db.Text
+  receiptFileUrl  String?
+
+  registeredById String?
+  registeredBy   User?    @relation("PaymentRegisteredBy", fields: [registeredById], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  accountMovement AccountMovement?
+
+  @@map("payments")
+}
+
+// ----------------------------------------------------------------------------
+// DEVOLUCIONES
+// ----------------------------------------------------------------------------
+
+model Return {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  returnDate DateTime @default(now())
+  reason     String   @db.Text
+
+  registeredById String?
+  registeredBy   User?    @relation("ReturnRegisteredBy", fields: [registeredById], references: [id])
+
+  createdAt DateTime @default(now())
+
+  items ReturnItem[]
+
+  @@map("returns")
+}
+
+model ReturnItem {
+  id                 String           @id @default(cuid())
+  returnId           String
+  return             Return           @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  consignmentBatchId String
+  consignmentBatch   ConsignmentBatch @relation(fields: [consignmentBatchId], references: [id])
+  productId          String
+  product            Product          @relation(fields: [productId], references: [id])
+
+  quantity Decimal @db.Decimal(14, 3)
+
+  createdAt DateTime @default(now())
+
+  @@map("return_items")
+}
+
+// ----------------------------------------------------------------------------
+// AJUSTES DE INVENTARIO
+// ----------------------------------------------------------------------------
+
+model InventoryAdjustment {
+  id                 String           @id @default(cuid())
+  customerId         String
+  customer           Customer         @relation(fields: [customerId], references: [id])
+  consignmentBatchId String
+  consignmentBatch   ConsignmentBatch @relation(fields: [consignmentBatchId], references: [id])
+  productId          String
+  product            Product          @relation(fields: [productId], references: [id])
+
+  quantity Decimal @db.Decimal(14, 3) // signado: + o -
+  reason   String  @db.Text // obligatorio
+  category String // "PRODUCTO_PERDIDO" | "PRODUCTO_DAÑADO" | "DIFERENCIA_CONTEO" | "CORRECCION" | "OTRO"
+
+  createdById String?
+  createdBy   User?    @relation("AdjustmentCreatedBy", fields: [createdById], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@map("inventory_adjustments")
+}
+
+// ----------------------------------------------------------------------------
+// CUENTAS POR COBRAR — LIBRO DE MOVIMIENTOS (fuente de verdad del saldo)
+// ----------------------------------------------------------------------------
+// El saldo pendiente de un cliente NUNCA se guarda como un campo editable:
+// siempre es SUM(debit) - SUM(credit) de esta tabla, ordenado por fecha. Esto
+// hace que el "estado de cuenta" (sección 11) sea, literalmente, un SELECT de
+// esta tabla, y que sea imposible que un pago desincronice el saldo.
+
+enum AccountMovementType {
+  CARGO_VENTA // corte de consignación (débito)
+  PAGO // pago recibido (crédito)
+  NOTA_CREDITO // crédito manual (crédito)
+  OTRO_CARGO // cargo manual (débito)
+}
+
+model AccountMovement {
+  id         String   @id @default(cuid())
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id])
+
+  type   AccountMovementType
+  date   DateTime            @default(now())
+  debit  Decimal             @default(0) @db.Decimal(14, 2)
+  credit Decimal             @default(0) @db.Decimal(14, 2)
+
+  documentType String // "Corte" | "Pago" | "Nota de crédito" | "Cargo manual"
+  documentRef  String // ej. "Corte #00021" o número de referencia de pago
+
+  consignmentCutId String?
+  consignmentCut    ConsignmentCut? @relation(fields: [consignmentCutId], references: [id])
+  paymentId         String?         @unique
+  payment           Payment?        @relation(fields: [paymentId], references: [id])
+
+  notes String? @db.Text
+
+  createdById String?
+  createdBy   User?    @relation("AccountMovementCreatedBy", fields: [createdById], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([customerId, date])
+  @@map("account_movements")
+}
+
+// ----------------------------------------------------------------------------
+// AUDITORÍA
+// ----------------------------------------------------------------------------
+
+model AuditLog {
+  id     String @id @default(cuid())
+  userId String?
+  user   User?  @relation("AuditLogUser", fields: [userId], references: [id])
+
+  action     String // ej. "PRICE_EDIT", "INVENTORY_ADJUSTMENT", "PAYMENT_CREATE", "INVOICE_CONFIRM"
+  entityType String // ej. "Product", "ConsignmentCut", "Payment"
+  entityId   String
+
+  previousValue Json?
+  newValue      Json?
+
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([userId, createdAt])
+  @@map("audit_logs")
+}

@@ -1,0 +1,64 @@
+============================================================
+ Verificación de concurrencia — 2026-08-31T16:28:02Z
+ Logs en: /tmp/tmp.n5Vo26Bb7Y
+============================================================
+
+-- Preparando datos de prueba...
+   customer_id=b87dd336-ad6c-4910-9275-19c59a7610a4
+   product_id=23817b02-af79-49a9-ad79-22807e4b612b
+   batch_id=75a9cd09-30c3-4190-8e66-1e4af0e81173 (delivered_qty=100, sold_qty=0)
+
+== TEST 1: doble registro de venta/inventario sobre el mismo lote ==
+  --- salida T1 ---
+    BEGIN
+    UPDATE 1
+     pg_sleep 
+    ----------
+     
+    (1 row)
+    
+    COMMIT
+  --- salida T2 ---
+    BEGIN
+    psql:/tmp/tmp.n5Vo26Bb7Y/t2.sql:2: ERROR:  could not serialize access due to concurrent update
+    ROLLBACK
+  sold_qty final = 10.000 (esperado: 10, NO 20)
+  [PASS] T1 confirmó su transacción normalmente.
+  [PASS] T2 fue rechazada por Postgres con error de serialización (40001) — exactamente el código que withSerializableTransaction reintenta automáticamente.
+  [PASS] sold_qty quedó en 10 (una sola venta aplicada, no se perdió ni se duplicó la actualización).
+  sold_qty tras reintentar la operación de T2 = 20.000 (esperado: 20)
+  [PASS] El reintento (igual al que hace withSerializableTransaction tras un 40001/P2034) aplicó limpiamente, sin duplicar ni perder ninguna venta.
+
+== TEST 2: dos pagos concurrentes del mismo cliente ==
+  --- salida pago 1 ---
+    BEGIN
+    INSERT 0 1
+    INSERT 0 1
+     pg_sleep 
+    ----------
+     
+    (1 row)
+    
+    COMMIT
+  --- salida pago 2 ---
+    BEGIN
+    INSERT 0 1
+    INSERT 0 1
+     pg_sleep 
+    ----------
+     
+    (1 row)
+    
+    COMMIT
+  pagos registrados = 2 (esperado: 2)
+  saldo derivado del libro de movimientos = -65.00 (esperado: -65.00, ambos pagos contados)
+  [PASS] Ambos pagos concurrentes confirmaron sin conflicto (son INSERTs independientes, no compiten por una fila).
+  [PASS] Los dos pagos existen en la tabla (ninguno se perdió).
+  [PASS] El saldo derivado del libro de movimientos suma los dos pagos correctamente (-65.00 = -25.00 + -40.00 en crédito).
+
+============================================================
+ RESULTADO: TODAS LAS VERIFICACIONES DE CONCURRENCIA PASARON
+============================================================
+
+-- Limpiando datos de prueba...
+   listo.
